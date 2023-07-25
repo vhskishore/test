@@ -1,0 +1,248 @@
+# Starter pipeline
+# Start with a minimal pipeline that you can customize to build and deploy your code.
+# Add steps that build, run tests, deploy, and more:
+# https://aka.ms/yaml
+
+trigger:
+- development
+- uat
+- release/*
+
+pool:
+  name: LinuxAgentPool
+  demands:
+   - JAVA_VERSION -equals 11
+   - TERRAFORM -equals YES
+
+variables:
+  global_version: '1.0.0'
+  global_email: 'mavrick202@gmail.com'
+  azure_dev_sub: '9ce91e05-4b9e-4a42-95c1-4385c54920c6'
+
+stages:
+  - stage: BuildingJavaCodeWithMaven
+    pool:
+     name: LinuxAgentPool
+     demands:
+      - Agent.Name -equals LinuxAgent4
+    variables:
+      stage_version: '2.0.0'
+      stage_email: 'mavrick202@gmail.com'
+    jobs:
+    - job: BuildingJavaCodeJob
+      variables:
+        job_version: '3.0.0'
+        job_email: 'mavrick202@gmail.com'
+      timeoutInMinutes: 5
+      steps:
+        - script: echo $(Build.BuildId)
+          displayName: 'Display The Build-ID'
+
+        - script: ls -al && pwd
+          displayName: 'List Files & Current Working Directory'
+
+        - script: mvn clean package && ls -al
+          displayName: 'Run the maven build'
+
+        - script: ls -al && cp /home/adminsree/myagent/_work/1/s/target/spring-petclinic-2.7.3.jar ROOT$(Build.BuildId).jar && ls -al
+          displayName: 'List Files & Rename ROOT.jar'
+     
+        - script: rm -rf /artifacts/*.jar && cp ROOT$(Build.BuildId).jar /artifacts && ls -al /artifacts
+          displayName: 'Copy Artifact To Folder'
+
+        - script: echo $(global_version) && echo $(stage_version) && echo $(job_version)
+          displayName: 'Check Variables'
+
+        - task: CopyFiles@2
+          inputs:
+            Contents: 'ROOT$(Build.BuildId).jar'
+            TargetFolder: '$(Build.ArtifactStagingDirectory)'
+            OverWrite: true
+          displayName: 'Copying WAR file to ArtifactStagingDirector'
+
+        - task: PublishBuildArtifacts@1
+          inputs:
+            PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+            ArtifactName: 'ROOT$(Build.BuildId).jar'
+            publishLocation: 'Container'
+          displayName: 'Publishing JAR Artifact.'
+
+  - stage: CopyingArtifactsToAzureAndAws
+    jobs:
+    - job: CopyFilesToAzureBlob
+      timeoutInMinutes: 10
+      steps:
+      - checkout: none
+    
+      - task: AzureCLI@2
+        inputs:
+          azureSubscription: 'devopsb28-azure-connection'
+          scriptType: 'bash'
+          scriptLocation: 'inlineScript'
+          inlineScript: |
+            az storage blob upload-batch --account-name devopsb28adoartifacts  --account-key $(STORAGE_ACCOUNT_KEY) --destination artifacts --source /artifacts/
+        displayName: 'Azure Upload artifacts to Azure Blob'
+        continueOnError: true
+
+    - job: CopyFilesToAWSS3Bucket
+      dependsOn: CopyFilesToAzureBlob
+      condition: always() # succeededOrFailed() or always() or failed()
+      timeoutInMinutes: 5
+      steps:
+      - checkout: none                
+      - task: S3Upload@1
+        inputs:
+          awsCredentials: 'devopsb28-aws-connection'
+          regionName: 'us-east-1'
+          bucketName: 'devopsb28adoartifacts'
+          sourceFolder: '/artifacts/'
+          globExpressions: 'ROOT$(Build.BuildId).jar'
+        displayName: 'AWS Upload artifacts to AWS S3 Bucket'
+        continueOnError: true
+
+  - stage: BuildDockerImagePushToDockerHubAndAzureACR
+    jobs:
+    - job: BuildImageAndPushToDockerHub
+      timeoutInMinutes: 5
+      steps:
+      - checkout: none
+      - task: Docker@2
+        inputs:
+          containerRegistry: 'devopsb28-dockerhub-connection'
+          repository: 'sreeharshav/devopsb28adotesting'
+          command: 'buildAndPush'
+          Dockerfile: '**/Dockerfile'
+        displayName: 'Creating & Pushing Docker Image To Docker Registry HUB'
+        continueOnError: true
+    - job: BuildIMageAndPushToAzureACR
+      dependsOn: BuildIMageAndPushToDockerHub
+      condition: always() # succeededOrFailed() or always() or failed()
+      timeoutInMinutes: 5
+      steps:
+      - checkout: none
+      - task: Bash@3
+        inputs:
+          targetType: 'inline'
+          script: |
+            docker login -u devopsb28acr -p $(acrpassword) devopsb28acr.azurecr.io
+            docker tag sreeharshav/devopsb28adotesting:$(Build.BuildId) devopsb28acr.azurecr.io/devopsb28acr:$(Build.BuildId)
+            docker push devopsb28acr.azurecr.io/devopsb28acr:$(Build.BuildId)
+        displayName: 'Creating & Pushing Docker Image To Azure ACR'
+
+  - stage: DeployDockerImageToAzureACI
+    pool:
+     name: LinuxAgentPool 
+     demands:
+      - Agent.Name -equals LinuxAgent4
+    jobs:
+     - job: DeployAzureACI
+       timeoutInMinutes: 10
+       steps:
+       - checkout: none
+       - task: AzureCLI@2
+         inputs:
+           azureSubscription: 'devopsb28-azure-connection'
+           scriptType: 'bash'
+           scriptLocation: 'inlineScript'
+           inlineScript: 'az container create -g DEVAZADO --name devopsb28aci$(Build.BuildId) --image devopsb28acr.azurecr.io/devopsb28acr:$(Build.BuildId) --cpu 2 --memory 4 --ports 8080 --dns-name-label devopsb28aci$(Build.BuildId) --registry-username devopsb28acr --registry-password $(acrpassword) --location eastus'
+           #inlineScript: az group list
+         displayName: 'Deploy Docker Image to Azure Container Instances'
+         continueOnError: true
+
+  - stage: 'DeployingToStagingEnvironment'
+    pool: LinuxAgentPool
+    #  name: LinuxAgentPool
+    #  demands:
+    #  - Agent.Name -equals LinuxAgent4
+    displayName: 'Deploying To AWS Staging Environment'    
+    jobs:
+     - deployment: "DeployJARtoStagingServer"
+       environment: 
+         name: STAGING
+         resourceType: VirtualMachine
+       strategy:
+         runOnce:
+           deploy :
+             steps:
+              - script: PROC=$(ps -ef | grep -i jar | grep -v grep | awk {'print$2'}) && echo $PROC && sudo kill -9 $PROC
+                displayName: 'Stop Existing JAR File'
+                continueOnError: true 
+              - script: sudo java -jar /home/ubuntu/azagent/azagent/_work/1/ROOT$(Build.BuildId).jar/ROOT$(Build.BuildId).jar &
+                displayName: 'Running The Jar File'
+                continueOnError: true 
+
+  - stage: ValidatingStagingDeploy
+    pool:
+     name: LinuxAgentPool
+     demands:
+      - Agent.Name -equals LinuxAgent4
+    jobs:
+    - job: CheckingStagingDeployment
+      variables:
+        port_number: 200
+      timeoutInMinutes: 10
+      steps:
+        - checkout: none
+        - script: |
+            RESPONSE=$(curl -o /dev/null -s -w "%{http_code}\n" http://ec2-18-215-15-159.compute-1.amazonaws.com:8080/)
+            if [ ${RESPONSE} -eq $(port_number) ]
+            then
+            echo "The RESPONSE IS $RESPONSE"
+            echo "DEPLOYMENT TO STAGING IS SUCESSFULL. PROCEED TO PRODUCTION."
+            else
+            echo "The RESPONSE IS $RESPONSE"
+            echo "DEPLOYMENT FAILED IN STAGING"
+            exit 1
+            fi
+          displayName: 'Testing Tomcat Deployment'
+
+  - stage: 'DeployingToProdEnvironment'
+    pool: LinuxAgentPool
+    #  name: LinuxAgentPool
+    #  demands:
+    #  - Agent.Name -equals LinuxAgent4
+    displayName: 'Deploying To AWS Prod Environment'    
+    jobs:
+     - deployment: "DeployJARtoProdServer"
+       environment: 
+         name: PROD
+         resourceType: VirtualMachine
+       strategy:
+         runOnce:
+           deploy :
+             steps:
+              - script: PROC=$(ps -ef | grep -i jar | grep -v grep | awk {'print$2'}) && echo $PROC && sudo kill -9 $PROC
+                displayName: 'Stop Existing JAR File'
+                continueOnError: true 
+              - script: sudo java -jar /home/ubuntu/azagent/_work/1/ROOT$(Build.BuildId).jar/ROOT$(Build.BuildId).jar &
+                displayName: 'Running The Jar File'
+                continueOnError: true 
+
+  - stage: ValidatingProdDeploy
+    pool:
+     name: LinuxAgentPool
+     demands:
+      - Agent.Name -equals LinuxAgent4
+    jobs:
+    - job: CheckingStagingDeployment
+      variables:
+        port_number: 200
+      timeoutInMinutes: 10
+      steps:
+        - checkout: none
+        - script: |
+            RESPONSE=$(curl -o /dev/null -s -w "%{http_code}\n" http://ec2-34-232-51-87.compute-1.amazonaws.com:8080/)
+            if [ ${RESPONSE} -eq $(port_number) ]
+            then
+            echo "The RESPONSE IS $RESPONSE"
+            echo "DEPLOYMENT TO PRODUCTION IS SUCESSFULL."
+            else
+            echo "The RESPONSE IS $RESPONSE"
+            echo "DEPLOYMENT FAILED IN STAGING"
+            exit 1
+            fi
+          displayName: 'Testing Tomcat Deployment'
+
+
+
+
